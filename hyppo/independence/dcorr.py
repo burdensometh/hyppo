@@ -3,6 +3,7 @@ from numba import jit
 
 from ..tools import check_perm_blocks_dim, chi2_approx, compute_dist, convert_xy_float64
 
+from ._dcorr_blocks import dcorr_block_statistic, dcorr_block_test
 from ._utils import _CheckInputs
 from .base import IndependenceTest, IndependenceTestOutput
 
@@ -43,6 +44,16 @@ class Dcorr(IndependenceTest):
         function.
     bias : bool, default: False
         Whether or not to use the biased or unbiased test statistics.
+    memory_budget : int, str, or None, default: None
+        When set, enables an exact, memory-budgeted computation path for the
+        permutation test. The budget is an upper bound on the size of the
+        temporary arrays, expressed in bytes (int) or as a string such as
+        ``"256MB"``. Distance matrices are processed in row blocks and
+        permutations are applied through index views, so read-only
+        :class:`numpy.memmap` distance matrices are supported and no
+        permutation copies the full matrix. The biased and unbiased statistics
+        are unchanged; this only controls memory use, not the computation
+        result. ``None`` (the default) keeps the standard in-memory path.
     **kwargs
         Arbitrary keyword arguments for ``compute_distance``.
 
@@ -112,12 +123,15 @@ class Dcorr(IndependenceTest):
     .. footbibliography::
     """
 
-    def __init__(self, compute_distance="euclidean", bias=False, **kwargs):
+    def __init__(
+        self, compute_distance="euclidean", bias=False, memory_budget=None, **kwargs
+    ):
         # set is_distance to true if compute_distance is None
         self.is_distance = False
         if not compute_distance:
             self.is_distance = True
         self.bias = bias
+        self.memory_budget = memory_budget
         self.is_fast = False
         IndependenceTest.__init__(self, compute_distance=compute_distance, **kwargs)
 
@@ -139,6 +153,16 @@ class Dcorr(IndependenceTest):
         stat : float
             The computed Dcorr statistic.
         """
+        # memory-budgeted exact path: inputs are already distance matrices, so
+        # accumulate row sums and centered products in blocks without ever
+        # materializing a centered n x n copy (read-only memmaps included)
+        if self.memory_budget is not None and self.is_distance:
+            stat = dcorr_block_statistic(
+                x, y, bias=self.bias, memory_budget=self.memory_budget
+            )
+            self.stat = stat
+            return stat
+
         # Only convert dtype when inputs are raw data, not precomputed distance
         # matrices. Distance matrices produced by compute_dist are already float64;
         # converting them on every permutation call causes large unnecessary copies.
@@ -194,6 +218,15 @@ class Dcorr(IndependenceTest):
             block, samples are exchangeable. Blocks of samples from the same
             partition are also exchangeable between one another. If a column
             value is negative, that block is fixed and cannot be exchanged.
+        random_state : int or None, default: None
+            Seed controlling the permutation replications.
+
+        Notes
+        -----
+        When ``memory_budget`` is set, the exact permutation test is run with
+        block-bounded temporary arrays regardless of ``auto``: the chi-squared
+        approximation is skipped, and distance matrices (including read-only
+        memmaps) are streamed in row blocks through permutation index views.
 
         Returns
         -------
@@ -242,7 +275,28 @@ class Dcorr(IndependenceTest):
         ):
             self.is_fast = True
 
-        if auto and x.shape[0] > 20 and perm_blocks is None and not self.bias:
+        # memory-budgeted exact path: block the distance matrices and stream
+        # permutations through index views (no full-matrix copies per rep)
+        if self.memory_budget is not None and not self.is_fast:
+            if not self.is_distance:
+                x, y = compute_dist(
+                    x, y, metric=self.compute_distance, **self.kwargs
+                )
+                self.is_distance = True
+            stat, pvalue, null_dist = dcorr_block_test(
+                x,
+                y,
+                reps=reps,
+                workers=workers,
+                bias=self.bias,
+                memory_budget=self.memory_budget,
+                perm_blocks=perm_blocks,
+                random_state=random_state,
+            )
+            self.stat = stat
+            self.pvalue = pvalue
+            self.null_dist = null_dist
+        elif auto and x.shape[0] > 20 and perm_blocks is None and not self.bias:
             stat, pvalue = chi2_approx(self.statistic, x, y)
             self.stat = stat
             self.pvalue = pvalue
